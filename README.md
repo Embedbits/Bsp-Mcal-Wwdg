@@ -13,7 +13,36 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented (version 0.1.0, branch `Dev/STM32H5`).** The interface below is implemented for STM32H5 in
+> `Wwdg_Port.h` / `Wwdg_Types.h`, the registers are accessed only by the private `Wwdg_Reg.c/h`. Verified: unit tests
+> (Unity + CMock + RegMem) on all 12 STM32H5 lines (H503, H523, H533, H543, H553, H562, H563, H573, H5E4, H5E5, H5F4,
+> H5F5) and a compilation of the module for the same 12 lines. The integration tests (`Tests/IntegrationTests`) are only
+> compiled (`STM32H503xB_IntegrationTest`, `STM32H563xI_IntegrationTest`), they have not been run on hardware yet. Other
+> families: stories and branches follow.
+>
+> Notes of the STM32H5 implementation:
+> - Tick = 4096 x prescaler / f(PCLK1); a timeout of N ticks (1 ... 64) is the counter value 0x3F + N, a window of M ticks
+>   the window value 0x3F + M. Timeout and window are rounded **down** to whole ticks (the smallest prescaler wins), a
+>   timeout or a window shorter than one tick is rejected. A window equal to the timeout is allowed, a longer one is
+>   rejected (in ms). The achieved times are reported rounded down to us. The real timeout is up to one tick shorter (the
+>   prescaler phase at the counter write is unknown, see the reference manual).
+> - The counter register holds the running counter, the reload value cannot be read back. The module keeps the reload value
+>   and the APB clock frequency read at `Wwdg_Init`. **All getters** (`Wwdg_Get_State`, `Wwdg_Get_Timeout`,
+>   `Wwdg_Get_Window`, `Wwdg_Get_EarlyWakeup`, `Wwdg_Get_RemainingTime`) and `Wwdg_Set_Refresh` need a successful
+>   `Wwdg_Init` (also after `Wwdg_Deinit`, the watchdog keeps running) and return `WWDG_REQUEST_ERROR` before it. The
+>   getters read registers only: they use no other module, do not enable any clock and do not change anything.
+>   `Wwdg_Get_Window` returns `WWDG_TIME_UNUSED` when the window register is at its maximum (refresh allowed any time).
+> - A watchdog started by the hardware (option byte `WWDG_SW` cleared, "hardware mode") is **not part of this version**:
+>   its state is not read out before `Wwdg_Init`. `Wwdg_Init` can take over an already running watchdog (it reconfigures
+>   and reloads it). The device errata recommend not to use the hardware mode (ES0561 2.2.11, ES0565 2.2.16, ES0621
+>   2.2.7: debug authentication may fail).
+> - `Wwdg_Init` writes the prescaler with the window opened, starts (reloads) the counter and writes the final window, so
+>   the first counter write is never a window violation, also for a watchdog already running. Every write is verified by a
+>   read-back, on mismatch the module is deinitialized and an error is returned (the watchdog may be running already).
+> - The early wakeup enable bit can only be set (by software) and is cleared only by a system reset. `Wwdg_Deinit` therefore
+>   deactivates the NVIC line and removes the callback; the enable bit of CFR stays. With a callback the timeout has to be
+>   at least 2 ticks. `Wwdg_Set_Refresh` uses no other module and can be called from the callback.
+> - The WWDG clock is disabled after a reset: `Wwdg_Init` activates it through the Rcc module, the module never disables it.
 
 ---
 
@@ -65,8 +94,8 @@ One counter tick lasts `4096 x prescaler / f(PCLK)`. The module works with these
 ```
 
 The module chooses the **smallest prescaler** with which the timeout fits to the counter (the best resolution), rounds the
-timeout and the window to the counter ticks and verifies the written values by a read-back. `Wwdg_Get_Timeout`,
-`Wwdg_Get_Window` and `Wwdg_Get_EarlyWakeup` return the real values.
+timeout and the window **down** to whole counter ticks (a value below one tick is rejected) and verifies the written
+values by a read-back. `Wwdg_Get_Timeout`, `Wwdg_Get_Window` and `Wwdg_Get_EarlyWakeup` return the real values.
 
 Rules:
 
@@ -77,8 +106,9 @@ Rules:
    written.
 4. `Wwdg_Task` refreshes the watchdog automatically, but **only when the window is not used** - with a window the
    application has to call `Wwdg_Set_Refresh` inside it.
-5. If the watchdog was started by the option bytes (hardware watchdog mode of the families that have it),
-   `Wwdg_Get_State` returns active before `Wwdg_Init` and `Wwdg_Init` only takes over the refresh and the interrupt.
+5. All getters (`Wwdg_Get_State` included) return `WWDG_REQUEST_ERROR` until `Wwdg_Init` succeeded, they have no side
+   effects. A watchdog started by the option bytes (hardware watchdog mode of the families that have it) is not read out
+   before `Wwdg_Init`: this is **not part of this version**. `Wwdg_Init` can take over an already running watchdog.
 
 ---
 
@@ -89,7 +119,7 @@ master.
 
 | Family | Branch | Watchdog | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `WWDG`, APB1 clock, 7-bit counter, 3-bit prescaler (1 ... 128), early wakeup interrupt, hardware mode by the option byte `WWDG_SW` | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `WWDG`, APB1 clock, 7-bit counter, 3-bit prescaler (1 ... 128), early wakeup interrupt, hardware mode by the option byte `WWDG_SW` | implemented (0.1.0) |
 | STM32U5 | `Dev/STM32U5` | `WWDG`, APB1 clock | planned |
 | STM32G4, STM32L4 | `Dev/STM32G4`, `Dev/STM32L4` | `WWDG`, APB1 clock, 3-bit prescaler | planned |
 | STM32F4, STM32F7 | `Dev/STM32F4`, `Dev/STM32F7` | `WWDG`, APB1 clock, 2-bit prescaler (1 ... 8), no hardware mode | planned |
@@ -187,7 +217,7 @@ for( ;; )
 ```c
 wwdg_Time_us_t achievedTimeout = 0u;
 
-(void)Wwdg_Get_Timeout( &achievedTimeout );         /* e.g. 40 ms is rounded to the counter ticks */
+(void)Wwdg_Get_Timeout( &achievedTimeout );         /* e.g. 40 ms is rounded down to the counter ticks */
 ```
 
 The reset caused by the window watchdog is detected after the start-up by the RCC module:
@@ -211,7 +241,8 @@ The reset caused by the window watchdog is detected after the start-up by the RC
 - **Low-power and debug.** The behaviour in the low-power modes and the freezing of the counter when the core is
   stopped in the debugger differ between the families; the README of the family describes it.
 - **Not part of the first version:** the freezing of the counter in the debug mode (debug module), the selection of the
-  hardware watchdog mode (written by the flash / option bytes module).
+  hardware watchdog mode (written by the flash / option bytes module) and the read-out of a watchdog started by the
+  hardware mode before `Wwdg_Init`.
 
 ---
 
