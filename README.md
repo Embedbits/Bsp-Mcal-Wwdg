@@ -13,7 +13,53 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status (STM32H7, branch `Dev/STM32H7`): implemented (version 0.1.0).** Port of the STM32H5 module (the same WWDG
+> registers and register protocol: RM0433, RM0399, RM0455, RM0468 and RM0477 for STM32H7R / STM32H7S, built with this branch as
+> the Ral family STM32H7RS). The interface below is implemented in `Wwdg_Port.h` / `Wwdg_Types.h` as on STM32H5, the registers
+> are accessed only by the private `Wwdg_Reg.c/h`. The module compiles without warnings for the 22 STM32H7 lines, for the
+> Cortex-M4 of the 6 dual-core lines and for the 4 STM32H7R / STM32H7S lines. Unit tests (Unity + CMock + RegMem, 87 test
+> cases) pass on STM32H723, H743, H755, H7A3, H7B3, H7R3 and H7S7. Integration tests: the firmware builds for every STM32H7
+> and STM32H7R / STM32H7S preset; all 13 cases pass on NUCLEO-H723ZG, NUCLEO-H7A3ZI-Q and NUCLEO-H755ZI-Q (Cortex-M7), also
+> the resets by the watchdog (timeout, window violation, deinitialization) with the WWDG reset flag; NUCLEO-H7S3L8 not run
+> (board not connected), the Cortex-M4 of the dual-core lines not run.
+>
+> Notes of the STM32H7 implementation:
+> - **Watchdog of the core.** The module uses the window watchdog of the core it runs on: `WWDG1` on the STM32H7 lines and on
+>   the Cortex-M7 of the dual-core lines (STM32H745 / H747 / H755 / H757), `WWDG2` on their Cortex-M4 (CMSIS `CORE_CM4`), `WWDG`
+>   on STM32H7R / STM32H7S. The kernel clock is the APB clock of its bus (Rcc: APB3 for WWDG1, APB1 for WWDG2 and for the WWDG of
+>   STM32H7R / STM32H7S).
+> - **System reset scope.** RM0433, RM0399 and RM0468 (RCC_GCR) require the reset scope of the full system before the watchdog
+>   is enabled (WW1RSC for WWDG1, WW2RSC for WWDG2; with the scope of the core the behavior is not guaranteed). `Wwdg_Init` sets
+>   it through the Rcc module (`Rcc_Set_WwdgSystemReset`) after the activation of the clock and before any register of the
+>   watchdog is written; a refused scope deinitializes the module and returns an error, the watchdog is not started. The bit
+>   is cleared only by a system reset. STM32H7A3 / H7B0 / H7B3 and STM32H7R / STM32H7S have no RCC_GCR, their watchdog always
+>   resets the system.
+> - Tick = 4096 x prescaler / f(PCLK); a timeout of N ticks (1 ... 64) is the counter value 0x3F + N, a window of M ticks
+>   the window value 0x3F + M. Timeout and window are rounded **down** to whole ticks (the smallest prescaler wins), a
+>   timeout or a window shorter than one tick is rejected. A window equal to the timeout is allowed, a longer one is
+>   rejected (in ms). The achieved times are reported rounded down to us. The real timeout is up to one tick shorter (the
+>   prescaler phase at the counter write is unknown, see the reference manual).
+> - The counter register holds the running counter, the reload value cannot be read back. The module keeps the reload value
+>   and the APB clock frequency read at `Wwdg_Init`. **All getters** (`Wwdg_Get_State`, `Wwdg_Get_Timeout`,
+>   `Wwdg_Get_Window`, `Wwdg_Get_EarlyWakeup`, `Wwdg_Get_RemainingTime`) and `Wwdg_Set_Refresh` need a successful
+>   `Wwdg_Init` (also after `Wwdg_Deinit`, the watchdog keeps running) and return `WWDG_REQUEST_ERROR` before it. The
+>   getters read registers only: they use no other module, do not enable any clock and do not change anything.
+>   `Wwdg_Get_Window` returns `WWDG_TIME_UNUSED` when the window register is at its maximum (refresh allowed any time).
+> - The STM32H7 lines have no option byte which starts the window watchdog by the hardware (only the independent watchdogs
+>   have one). `Wwdg_Init` can take over an already running watchdog (it reconfigures and reloads it).
+> - `Wwdg_Init` writes the prescaler with the window opened, starts (reloads) the counter and writes the final window, so
+>   the first counter write is never a window violation, also for a watchdog already running. Every write is verified by a
+>   read-back, on mismatch the module is deinitialized and an error is returned (the watchdog may be running already).
+> - The early wakeup enable bit can only be set (by software) and is cleared only by a system reset. `Wwdg_Deinit` therefore
+>   deactivates the NVIC line and removes the callback; the enable bit of CFR stays. With a callback the timeout has to be
+>   at least 2 ticks. `Wwdg_Set_Refresh` uses no other module and can be called from the callback.
+> - The WWDG clock is disabled after a reset: `Wwdg_Init` activates it through the Rcc module, the module never disables it.
+> - **Device errata of the STM32H7 lines (bug AB#2311).** "AXI domain locked when watchdog reset limited to CPU1 or CPU2"
+>   (ES0392 Rev 15 2.2.1, ES0445 Rev 6 2.3.1): the workaround is the system reset scope, which `Wwdg_Init` sets before the
+>   watchdog is enabled. "WWDG not functional when VDD is lower than 2.7 V and VOS0 or VOS1 voltage level is selected" (ES0392
+>   Rev 15 2.2.23, ES0445 Rev 6 2.3.7, ES0491 Rev 9 2.16.1, no workaround): the module does not know VDD and the voltage scale,
+>   the application keeps VDD of at least 2.7 V or the voltage scale VOS2 / VOS3 when it relies on the watchdog. ES0478 Rev 12
+>   (STM32H7A3 / H7B0 / H7B3) and ES0596 Rev 10 (STM32H7R / STM32H7S) list no WWDG erratum.
 
 ---
 
@@ -65,8 +111,8 @@ One counter tick lasts `4096 x prescaler / f(PCLK)`. The module works with these
 ```
 
 The module chooses the **smallest prescaler** with which the timeout fits to the counter (the best resolution), rounds the
-timeout and the window to the counter ticks and verifies the written values by a read-back. `Wwdg_Get_Timeout`,
-`Wwdg_Get_Window` and `Wwdg_Get_EarlyWakeup` return the real values.
+timeout and the window **down** to whole counter ticks (a value below one tick is rejected) and verifies the written
+values by a read-back. `Wwdg_Get_Timeout`, `Wwdg_Get_Window` and `Wwdg_Get_EarlyWakeup` return the real values.
 
 Rules:
 
@@ -77,8 +123,9 @@ Rules:
    written.
 4. `Wwdg_Task` refreshes the watchdog automatically, but **only when the window is not used** - with a window the
    application has to call `Wwdg_Set_Refresh` inside it.
-5. If the watchdog was started by the option bytes (hardware watchdog mode of the families that have it),
-   `Wwdg_Get_State` returns active before `Wwdg_Init` and `Wwdg_Init` only takes over the refresh and the interrupt.
+5. All getters (`Wwdg_Get_State` included) return `WWDG_REQUEST_ERROR` until `Wwdg_Init` succeeded, they have no side
+   effects. A watchdog started by the option bytes (hardware watchdog mode of the families that have it) is not read out
+   before `Wwdg_Init`: this is **not part of this version**. `Wwdg_Init` can take over an already running watchdog.
 
 ---
 
@@ -89,11 +136,11 @@ master.
 
 | Family | Branch | Watchdog | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `WWDG`, APB1 clock, 7-bit counter, 3-bit prescaler (1 ... 128), early wakeup interrupt, hardware mode by the option byte `WWDG_SW` | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `WWDG`, APB1 clock, 7-bit counter, 3-bit prescaler (1 ... 128), early wakeup interrupt, hardware mode by the option byte `WWDG_SW` | implemented (0.1.0) |
 | STM32U5 | `Dev/STM32U5` | `WWDG`, APB1 clock | planned |
 | STM32G4, STM32L4 | `Dev/STM32G4`, `Dev/STM32L4` | `WWDG`, APB1 clock, 3-bit prescaler | planned |
 | STM32F4, STM32F7 | `Dev/STM32F4`, `Dev/STM32F7` | `WWDG`, APB1 clock, 2-bit prescaler (1 ... 8), no hardware mode | planned |
-| STM32H7 | `Dev/STM32H7` | `WWDG1` (and `WWDG2` on the dual core devices) | planned |
+| STM32H7 | `Dev/STM32H7` | `WWDG1` (STM32H7 lines, Cortex-M7 of the dual-core lines), `WWDG2` (Cortex-M4 of the dual-core lines), `WWDG` (STM32H7R / STM32H7S), APB clock, 7-bit counter, 3-bit prescaler (1 ... 128), early wakeup interrupt, system reset scope set through Rcc (RCC_GCR.WW1RSC / WW2RSC) | implemented (0.1.0) |
 | STM32U3 | `Dev/STM32U3` | `WWDG` | planned |
 
 A function without a meaning in a family stays in the interface, returns `WWDG_REQUEST_ERROR` and suppresses the unused
@@ -187,7 +234,7 @@ for( ;; )
 ```c
 wwdg_Time_us_t achievedTimeout = 0u;
 
-(void)Wwdg_Get_Timeout( &achievedTimeout );         /* e.g. 40 ms is rounded to the counter ticks */
+(void)Wwdg_Get_Timeout( &achievedTimeout );         /* e.g. 40 ms is rounded down to the counter ticks */
 ```
 
 The reset caused by the window watchdog is detected after the start-up by the RCC module:
@@ -211,7 +258,8 @@ The reset caused by the window watchdog is detected after the start-up by the RC
 - **Low-power and debug.** The behaviour in the low-power modes and the freezing of the counter when the core is
   stopped in the debugger differ between the families; the README of the family describes it.
 - **Not part of the first version:** the freezing of the counter in the debug mode (debug module), the selection of the
-  hardware watchdog mode (written by the flash / option bytes module).
+  hardware watchdog mode (written by the flash / option bytes module) and the read-out of a watchdog started by the
+  hardware mode before `Wwdg_Init`.
 
 ---
 
